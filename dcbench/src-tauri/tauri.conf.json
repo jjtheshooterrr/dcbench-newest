@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DC Bench",
+  "version": "0.1.0",
+  "identifier": "com.marketintegrators.dcbench",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [{ "title": "DC Bench", "width": 1400, "height": 900, "minWidth": 1000, "minHeight": 650 }],
+    "security": { "csp": null }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis", "dmg"],
+    "icon": ["icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "windows": { "wix": { "language": "en-US" } },
+    "fileAssociations": [{ "ext": ["dcj"], "name": "DC Bench job", "description": "DC Bench survey job", "role": "Editor" }]
+  }
+}
