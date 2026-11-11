@@ -101,3 +101,47 @@ export function polarToLocal(hzDeg: number, vDeg: number, slope: number): Vec3 {
   const hd = slope * Math.sin(v);
   return [hd * Math.sin(hz), hd * Math.cos(hz), slope * Math.cos(v)];
 }
+
+/** Gaussian elimination with partial pivoting for a dense n×n system. */
+export function solveN(Ain: number[][], bin: number[]): number[] {
+  const n = bin.length, A = Ain.map((r, i) => [...r, bin[i]]);
+  const scale = Math.max(1e-300, ...Ain.flat().map(Math.abs));
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if (Math.abs(A[p][c]) < 1e-13 * scale) throw new Error("Singular system (degenerate geometry)");
+    [A[c], A[p]] = [A[p], A[c]];
+    for (let r = c + 1; r < n; r++) { const k = A[r][c] / A[c][c]; for (let j = c; j <= n; j++) A[r][j] -= k * A[c][j]; }
+  }
+  const x = Array(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) { let s = A[r][n]; for (let j = r + 1; j < n; j++) s -= A[r][j] * x[j]; x[r] = s / A[r][r]; }
+  return x;
+}
+
+/** Levenberg-Marquardt with a central-difference Jacobian. Minimises Σ fn(x)². */
+export function levenbergMarquardt(fn: (x: number[]) => number[], x0: number[], opts: { maxIter?: number; steps?: number[] } = {}): { x: number[]; residuals: number[]; iterations: number } {
+  let x = x0.slice(), r = fn(x), cost = r.reduce((s, v) => s + v * v, 0), lambda = 1e-3, it = 0;
+  const n = x.length, maxIter = opts.maxIter ?? 100;
+  for (; it < maxIter; it++) {
+    const J: number[][] = r.map(() => Array(n).fill(0));
+    for (let j = 0; j < n; j++) {
+      const h = opts.steps?.[j] ?? 1e-6 * Math.max(1, Math.abs(x[j]));
+      const xp = x.slice(), xm = x.slice(); xp[j] += h; xm[j] -= h;
+      const rp = fn(xp), rm = fn(xm);
+      for (let i = 0; i < r.length; i++) J[i][j] = (rp[i] - rm[i]) / (2 * h);
+    }
+    const A = Array.from({ length: n }, () => Array(n).fill(0)), g = Array(n).fill(0);
+    for (let i = 0; i < r.length; i++) for (let a = 0; a < n; a++) { g[a] += J[i][a] * r[i]; for (let b = 0; b < n; b++) A[a][b] += J[i][a] * J[i][b]; }
+    let improved = false, stepNorm = 0;
+    for (let tries = 0; tries < 12 && !improved; tries++) {
+      const Ad = A.map((row, i) => row.map((v, j) => (i === j ? v * (1 + lambda) + 1e-300 : v)));
+      let d: number[];
+      try { d = solveN(Ad, g.map(v => -v)); } catch { lambda *= 10; continue; }
+      const xn = x.map((v, i) => v + d[i]), rn = fn(xn), cn = rn.reduce((s, v) => s + v * v, 0);
+      if (cn <= cost) { stepNorm = Math.hypot(...d); x = xn; r = rn; const drop = cost - cn; cost = cn; lambda = Math.max(lambda / 10, 1e-12); improved = true; if (drop < 1e-22) return { x, residuals: r, iterations: it + 1 }; }
+      else lambda *= 10;
+    }
+    if (!improved || stepNorm < 1e-13 * (1 + Math.hypot(...x))) break;
+  }
+  return { x, residuals: r, iterations: it };
+}

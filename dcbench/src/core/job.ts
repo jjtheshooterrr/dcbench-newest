@@ -2,7 +2,7 @@
 import { Vec3, Mat3 } from "./geom";
 import { SurveyPoint } from "./formats";
 
-export type FitKind = "bestfit3d" | "bestfit2d" | "plane" | "circle" | "flange" | "corner" | "line" | "transform";
+export type FitKind = "bestfit3d" | "bestfit2d" | "plane" | "circle" | "cylinder" | "sphere" | "flange" | "corner" | "line" | "transform";
 
 export interface FitRecord {
   id: string;

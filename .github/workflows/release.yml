@@ -56,7 +56,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: dcbench
-          tagName: v0.1.0
-          releaseName: "DC Bench v0.1.0"
+          tagName: v__VERSION__
+          releaseName: "DC Bench v__VERSION__"
           releaseDraft: true
           args: ${{ matrix.args }}
