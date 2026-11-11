@@ -1,11 +1,15 @@
-import { Vec3, Mat3, rotZYX, centroid, eulerZYX } from "./core/geom";
-import { bestFit, planeFit, circleFit3D, flangeFit, cornerFit, lineFit, levelTo, transformPoints } from "./core/fits";
+import { Vec3, Mat3, rotZYX, centroid, eulerZYX, add, scl, cross, unit } from "./core/geom";
+import { bestFit, planeFit, circleFit3D, flangeFit, cornerFit, lineFit, levelTo, transformPoints, cylinderFit, sphereFit } from "./core/fits";
+import { inverse, pointToLine, pointToPlane, lineLine } from "./core/cogo";
 import { SurveyPoint, importAny, writeCSV, writeGSI } from "./core/formats";
 import { Job, newJob, serializeJob, parseJob, upsertPoints, applyTransformToJob, toUnits, fromUnits, UNIT_FACTOR, FitRecord } from "./core/job";
 import { GeoComClient, SimulatedInstrument, BAP_PRG, Transport, Measurement } from "./core/geocom";
 import { DxfWriter } from "./core/dxf";
 import { openTextFile, saveTextFile, toast } from "./ui/io";
 import { drawPlot, PlotSpec } from "./ui/plot";
+import { confirmBox, promptBox, notify } from "./ui/dialog";
+import { View3D, Scene3D } from "./ui/view3d";
+import { samplePoints } from "./ui/sample";
 
 // ---------- state ----------
 let job: Job = newJob();
@@ -27,11 +31,12 @@ const stamp = () => `DC Bench · ${job.name} · ${new Date().toISOString().slice
 
 // ---------- layout ----------
 const SCREENS: { id: string; label: string; grp: string }[] = [
-  { id: "job", label: "Job & points", grp: "Job" }, { id: "instrument", label: "Instrument", grp: "Job" },
+  { id: "job", label: "Job & points", grp: "Job" }, { id: "view3d", label: "3D view", grp: "Job" }, { id: "instrument", label: "Instrument", grp: "Job" },
   { id: "bestfit", label: "2D / 3D best-fit", grp: "Fits" }, { id: "plane", label: "Plane fit", grp: "Fits" }, { id: "circle", label: "Circle fit", grp: "Fits" },
+  { id: "cylinder", label: "Cylinder / pipe fit", grp: "Fits" }, { id: "sphere", label: "Sphere fit", grp: "Fits" },
   { id: "line", label: "Line / axis fit", grp: "Fits" }, { id: "corner", label: "Corner fit", grp: "Fits" },
   { id: "flange", label: "Flange", grp: "Piping" },
-  { id: "transform", label: "Translate / rotate", grp: "Geometry" }, { id: "level", label: "Pitch & roll (level)", grp: "Geometry" },
+  { id: "cogo", label: "COGO / inverse", grp: "Geometry" }, { id: "transform", label: "Translate / rotate", grp: "Geometry" }, { id: "level", label: "Pitch & roll (level)", grp: "Geometry" },
   { id: "cad", label: "Plot to CAD (DXF)", grp: "Output" }, { id: "report", label: "Job report", grp: "Output" },
 ];
 
@@ -44,24 +49,34 @@ function renderShell() {
   const rail = el(`<nav class="rail"></nav>`); let lastGrp = "";
   for (const s of SCREENS) { if (s.grp !== lastGrp) { rail.append(el(`<div class="grp">${s.grp}</div>`)); lastGrp = s.grp; } const b = el(`<button data-id="${s.id}">${s.label}</button>`); b.onclick = () => show(s.id); rail.append(b); }
   app.append(rail, el(`<main class="work" id="work"></main>`), el(`<div class="status"><span><span class="dot" id="connDot"></span><span id="connText"></span></span><span id="stPoints"></span><span id="stUnits"></span><span class="spacer"></span><span id="stPath"></span></div>`));
-  $("#mNew").onclick = () => { if (confirmLose()) { job = newJob(); jobPath = null; selected.clear(); show("job"); } };
+  $("#mNew").onclick = async () => { if (await confirmLose()) { job = newJob(); jobPath = null; selected.clear(); show("job"); } };
   $("#mOpen").onclick = openJob; $("#mSave").onclick = () => saveJob(false); $("#mSaveAs").onclick = () => saveJob(true);
   $("#mImport").onclick = importPoints; $("#mExport").onclick = exportPoints;
   document.addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key === "s") { e.preventDefault(); saveJob(e.shiftKey); } if ((e.ctrlKey || e.metaKey) && e.key === "o") { e.preventDefault(); openJob(); } });
 }
-function confirmLose() { return job.points.length === 0 || window.confirm("Discard the current job?"); }
+async function confirmLose() { return job.points.length === 0 || (await confirmBox("Discard the current job? Unsaved changes will be lost.", "Discard")); }
+async function loadSample() {
+  if (!(await confirmLose())) return;
+  job = newJob("Sample job"); job.points = samplePoints(); job.history.push({ at: new Date().toISOString(), what: "Loaded the built-in example points" });
+  jobPath = null; selected.clear(); show(screen); toast("Sample job loaded — every point is an example");
+}
 function refreshStatus() {
   $("#jobName").textContent = job.name; $("#stPoints").textContent = `${job.points.length} points`; $("#stUnits").textContent = `${job.units} · tol ±${job.tolerance}`;
   $("#stPath").textContent = jobPath ?? "(unsaved)"; $("#connText").textContent = instrumentLabel; $("#connDot").classList.toggle("on", !!client);
   document.querySelectorAll<HTMLButtonElement>(".rail button").forEach(b => b.setAttribute("aria-current", String(b.dataset.id === screen)));
 }
-function show(id: string) { screen = id; const w = $("#work"); w.innerHTML = ""; (RENDER[id] ?? RENDER.job)(w); refreshStatus(); }
+function show(id: string) { screen = id; const w = $("#work"); w.innerHTML = ""; (RENDER[id] ?? RENDER.job)(w);
+  if (!job.points.length && !["job", "instrument", "report"].includes(id)) {
+    const e = el(`<section class="panel"><h2>No points in this job yet</h2><div class="note" style="margin:0 0 4px">Import a Leica GSI, CSV or Trimble JobXML file, measure from the Instrument screen, or load the built-in example to try this screen.</div><div class="actions"><button class="btn primary" id="esImport">Import points…</button><button class="btn" id="esSample">Load sample job</button></div></section>`);
+    w.prepend(e); $("#esImport", e).onclick = importPoints; $("#esSample", e).onclick = loadSample;
+  }
+  refreshStatus(); }
 
 // ---------- job I/O ----------
 async function openJob() {
-  if (!confirmLose()) return;
+  if (!(await confirmLose())) return;
   const r = await openTextFile([{ name: "DC Bench job", extensions: ["dcj", "json"] }]); if (!r) return;
-  try { job = parseJob(r.text); jobPath = r.name; selected.clear(); show("job"); toast(`Opened ${r.name}`); } catch (e: any) { alert(e.message); }
+  try { job = parseJob(r.text); jobPath = r.name; selected.clear(); show("job"); toast(`Opened ${r.name}`); } catch (e: any) { notify(e.message); }
 }
 async function saveJob(as: boolean) {
   const name = jobPath && !as ? jobPath : `${job.name.replace(/[^\w.-]+/g, "_")}.dcj`;
@@ -76,10 +91,10 @@ async function importPoints() {
     toast(`Imported ${res.points.length} points from ${r.name}` + (res.warnings.length ? ` (${res.warnings.length} warnings)` : ""));
     if (res.warnings.length) console.warn(res.warnings);
     show("job");
-  } catch (e: any) { alert("Import failed: " + e.message); }
+  } catch (e: any) { notify("Import failed: " + e.message); }
 }
 async function exportPoints() {
-  const which = window.prompt("Export format: csv, gsi16, gsi8", "csv")?.toLowerCase(); if (!which) return;
+  const which = await promptBox(`Export ${selected.size ? selected.size + " selected" : "all " + job.points.length} point(s) as`, "csv", ["csv", "gsi16", "gsi8"]); if (!which) return;
   const pts = selected.size ? job.points.filter(p => selected.has(p.name)) : job.points;
   if (which.startsWith("gsi")) await saveTextFile(`${job.name}.gsi`, writeGSI(pts, which === "gsi16"), [{ name: "Leica GSI", extensions: ["gsi"] }]);
   else await saveTextFile(`${job.name}.csv`, writeCSV(pts, "PENZ", 4), [{ name: "CSV", extensions: ["csv"] }]);
@@ -150,15 +165,16 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
     ($("#ju", hdr) as HTMLSelectElement).value = job.units;
     hdr.addEventListener("change", () => { job.name = ($("#jn", hdr) as HTMLInputElement).value; job.client = ($("#jc", hdr) as HTMLInputElement).value; job.site = ($("#js", hdr) as HTMLInputElement).value; job.surveyor = ($("#jv", hdr) as HTMLInputElement).value; job.units = ($("#ju", hdr) as HTMLSelectElement).value as Job["units"]; job.tolerance = +($("#jt", hdr) as HTMLInputElement).value; show("job"); });
     const pts = el(`<section class="panel"><h2>Points <span class="hint">${job.points.length} in job · ${selected.size} selected</span></h2>
-      <div class="actions"><button class="btn" id="pAdd">Add point</button><button class="btn" id="pDel">Delete selected</button><button class="btn" id="pRen">Rename selected</button><button class="btn" id="pSelAll">Select all</button><button class="btn" id="pSelNone">Clear selection</button></div>
+      <div class="actions"><button class="btn" id="pAdd">Add point</button><button class="btn" id="pDel">Delete selected</button><button class="btn" id="pRen">Rename selected</button><button class="btn" id="pSelAll">Select all</button><button class="btn" id="pSelNone">Clear selection</button><button class="btn" id="pSample">Load sample job</button></div>
       <textarea id="paste" placeholder="Paste points here: Name  E  N  H  (tab, comma or space separated). Then press Add pasted."></textarea>
       <div class="actions"><button class="btn primary" id="pPaste">Add pasted</button></div></section>`);
     const tbl = pointTable(job.points, { selectable: true }); pts.append(tbl);
     onSelChange = () => { $(".hint", pts).textContent = `${job.points.length} in job · ${selected.size} selected`; };
-    $("#pPaste", pts).onclick = () => { try { const r = importAny(($("#paste", pts) as HTMLTextAreaElement).value, "paste.csv"); r.points.forEach(p => { p.p = p.p.map(v => fromUnits(v, job.units)) as Vec3; p.source = "manual"; }); upsertPoints(job, r.points); show("job"); } catch (e: any) { alert(e.message); } };
-    $("#pAdd", pts).onclick = () => { const n = window.prompt("Point name"); if (!n) return; const v = window.prompt(`E N H in ${job.units}`, "0 0 0")?.split(/[\s,]+/).map(Number); if (!v || v.length < 3) return; upsertPoints(job, [{ name: n, p: v.slice(0, 3).map(x => fromUnits(x, job.units)) as Vec3, source: "manual" }]); show("job"); };
+    $("#pPaste", pts).onclick = () => { try { const r = importAny(($("#paste", pts) as HTMLTextAreaElement).value, "paste.csv"); r.points.forEach(p => { p.p = p.p.map(v => fromUnits(v, job.units)) as Vec3; p.source = "manual"; }); upsertPoints(job, r.points); show("job"); } catch (e: any) { notify(e.message); } };
+    $("#pAdd", pts).onclick = async () => { const n = await promptBox("Point name", nextName()); if (!n) return; const v = (await promptBox(`E  N  H of ${n} in ${job.units}`, "0 0 0"))?.split(/[\s,]+/).map(Number); if (!v || v.length < 3) return; upsertPoints(job, [{ name: n, p: v.slice(0, 3).map(x => fromUnits(x, job.units)) as Vec3, source: "manual" }]); show("job"); };
     $("#pDel", pts).onclick = () => { if (!selected.size) return; job.points = job.points.filter(p => !selected.has(p.name)); selected.clear(); show("job"); };
-    $("#pRen", pts).onclick = () => { if (selected.size !== 1) return alert("Select exactly one point"); const old = [...selected][0], n = window.prompt("New name", old); if (!n) return; job.points.find(p => p.name === old)!.name = n; selected = new Set([n]); show("job"); };
+    $("#pRen", pts).onclick = async () => { if (selected.size !== 1) return notify("Select exactly one point to rename."); const old = [...selected][0], n = await promptBox(`New name for ${old}`, old); if (!n) return; job.points.find(p => p.name === old)!.name = n; selected = new Set([n]); show("job"); };
+    $("#pSample", pts).onclick = loadSample;
     $("#pSelAll", pts).onclick = () => { job.points.forEach(p => selected.add(p.name)); show("job"); }; $("#pSelNone", pts).onclick = () => { selected.clear(); show("job"); };
     const fits = el(`<section class="panel"><h2>Saved fits <span class="hint">${job.fits.length}</span></h2>${job.fits.length ? `<div class="tbl">${tableHTML(["Fit", "Type", "Created", ""], job.fits.map(ft => [ft.title, ft.kind, ft.created.slice(0, 16).replace("T", " "), `<button class="btn" data-del="${ft.id}">Remove</button>`]))}</div>` : `<div class="note">No fits saved yet. Each fit screen has a "Save to job" button; saved fits appear in the job report and DXF.</div>`}</section>`);
     fits.querySelectorAll<HTMLButtonElement>("[data-del]").forEach(b => (b.onclick = () => { job.fits = job.fits.filter(x => x.id !== b.dataset.del); show("job"); }));
@@ -170,7 +186,7 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
       <div class="kv"><label>Port</label><div style="display:flex;gap:6px"><select id="port" style="flex:1"><option value="sim">Simulator (no instrument)</option></select><button class="btn" id="refresh">Refresh</button></div>
       <label>Baud</label><select id="baud"><option>115200</option><option>57600</option><option>38400</option><option>19200</option><option>9600</option></select>
       <label>Measure program</label><select id="prg"><option value="${BAP_PRG.SINGLE_REF_STANDARD}">Prism — standard</option><option value="${BAP_PRG.SINGLE_REF_FAST}">Prism — fast</option><option value="${BAP_PRG.SINGLE_RLESS_VISIBLE}">Reflectorless</option><option value="${BAP_PRG.AVG_REF_STANDARD}">Prism — averaged</option></select></div>
-      <div class="actions"><button class="btn primary" id="connect">${client ? "Disconnect" : "Connect"}</button><button class="btn" id="atrOn">ATR on</button><button class="btn" id="atrOff">ATR off</button><button class="btn" id="laser">Laser pointer</button></div>
+      <div class="actions"><button class="btn primary" id="connect">${client ? "Disconnect" : "Connect"}</button><button class="btn" id="atrOn">ATR on</button><button class="btn" id="atrOff">ATR off</button><button class="btn" id="laser">Laser pointer</button><button class="btn" id="corr">Read corrections</button></div>
       <div class="note">On the instrument set the interface to GeoCOM (Captivate: Settings → Connections → GeoCOM, matching baud). Measuring works without a robotic licence; turning, ATR and PowerSearch need the GeoCOM Robotic licence on the instrument.</div>
       <div class="err" id="ierr" hidden></div></section>
       <section class="panel"><h2>Station setup</h2><div class="kv">
@@ -205,6 +221,7 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
     $("#atrOn", box).onclick = () => client?.setAtr(true).then(() => toast("ATR on")).catch(e => err(e.message));
     $("#atrOff", box).onclick = () => client?.setAtr(false).then(() => toast("ATR off")).catch(e => err(e.message));
     $("#laser", box).onclick = () => client?.laserPointer(true).catch(e => err(e.message));
+    $("#corr", box).onclick = async () => { if (!client) return err("Connect first"); try { const c = await client.corrections(); await notify(`Values as reported by the instrument:\n\nPrism constant   ${c.prismConstant}\nPressure         ${c.pressure}\nDry temperature  ${c.dryTemp}\nWet temperature  ${c.wetTemp}\nEDM wavelength   ${c.wavelength}\n\nCheck the prism constant matches the target in use before measuring.`); err(""); } catch (e: any) { err(e.message); } };
     ($("#stPt", box) as HTMLSelectElement).onchange = (e) => { const p = job.points.find(x => x.name === (e.target as HTMLSelectElement).value); if (p) ($("#stXYZ", box) as HTMLInputElement).value = p.p.map(v => f(v, 4)).join(" "); };
     $("#setStation", box).onclick = async () => {
       if (!client) return err("Connect first");
@@ -229,7 +246,7 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
       } catch (e: any) { err(e.message); }
     };
     $("#angles", meas).onclick = async () => { if (!client) return; try { const a = await client.angles(); lastMeasure = { hz: a.hz, v: a.v, sd: 0, timestamp: "" }; renderLast(); } catch (e: any) { err(e.message); } };
-    $("#turnTo", meas).onclick = async () => { if (!client) return; const n = window.prompt("Turn to job point (name) — needs robotic licence"); const p = job.points.find(x => x.name === n); if (!p) return; try { const st = await client.getStation(); const d: Vec3 = [p.p[0] - st.E, p.p[1] - st.N, p.p[2] - st.H - st.hi]; const hz = (Math.atan2(d[0], d[1]) * 180 / Math.PI + 360) % 360, v = Math.acos(d[2] / Math.hypot(...d)) * 180 / Math.PI; await client.turnTo(hz, v, true); toast(`Turned to ${n}`); } catch (e: any) { err(e.message); } };
+    $("#turnTo", meas).onclick = async () => { if (!client) return; const n = await promptBox("Turn to which job point? (needs the robotic licence)", "", job.points.map(x => x.name)); const p = job.points.find(x => x.name === n); if (!p) return; try { const st = await client.getStation(); const d: Vec3 = [p.p[0] - st.E, p.p[1] - st.N, p.p[2] - st.H - st.hi]; const hz = (Math.atan2(d[0], d[1]) * 180 / Math.PI + 360) % 360, v = Math.acos(d[2] / Math.hypot(...d)) * 180 / Math.PI; await client.turnTo(hz, v, true); toast(`Turned to ${n}`); } catch (e: any) { err(e.message); } };
   },
 
   bestfit(w) {
@@ -258,8 +275,8 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
         $(".sv", out.el).onclick = () => saveFit(twoD ? "bestfit2d" : "bestfit3d", `${twoD ? "2D" : "3D"} best-fit (${pairs.length} pts)`, { design: des.names(), measured: mea.names(), scale, twoD }, { R: r.R, t: r.t, s: r.s, rms: r.rms, max: r.max, rotXYZ: r.rotXYZ, residuals: r.residuals }, rep);
       } catch (e: any) { out.error(e.message); }
     };
-    $("#apply", opts).onclick = () => {
-      if (!last) return; if (!window.confirm("Transform the measured points INTO the design frame (inverse of the fit) and overwrite them in the job?")) return;
+    $("#apply", opts).onclick = async () => {
+      if (!last) return; if (!await confirmBox("Transform the measured points INTO the design frame (inverse of the fit) and overwrite them in the job?")) return;
       // inverse: design ≈ (1/s)·Rᵀ·(measured − t)
       const Rt: Mat3 = [[last.R[0][0], last.R[1][0], last.R[2][0]], [last.R[0][1], last.R[1][1], last.R[2][1]], [last.R[0][2], last.R[1][2], last.R[2][2]]];
       const tInv: Vec3 = [-(Rt[0][0] * last.t[0] + Rt[0][1] * last.t[1] + Rt[0][2] * last.t[2]) / last.s, -(Rt[1][0] * last.t[0] + Rt[1][1] * last.t[1] + Rt[1][2] * last.t[2]) / last.s, -(Rt[2][0] * last.t[0] + Rt[2][1] * last.t[1] + Rt[2][2] * last.t[2]) / last.s];
@@ -279,7 +296,7 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
         const rep = [stamp(), "Plane fit (orthogonal least squares)", "", `Normal    ${r.n.map(v => v.toFixed(7)).join("  ")}`, `Centroid  ${r.c.map(v => f(v)).join("  ")}`, `Pitch ${fa(r.pitchDeg)}  Roll ${fa(r.rollDeg)}  Tilt ${fa(r.tiltDeg)}`, "", "Offsets from plane (+ along normal)", ...rows.map(rw => "  " + rw[0].padEnd(10) + rw[4].padStart(10) + (rw[5].includes("bad") ? "  OUT" : "")), "", `Flatness RMS ${f(r.rms)}  range ${f(Math.max(...r.residuals) - Math.min(...r.residuals))} ${job.units}`].join("\n");
         out.report(rep); out.error(""); out.plot({ pts: P.map(p => p.p), names: P.map(p => p.name), residuals: r.residuals, tol: job.tolerance, unitFactor: unitF() });
         ($("#lvl", opts) as HTMLButtonElement).disabled = false;
-        $("#lvl", opts).onclick = () => { if (!window.confirm("Rotate ALL job points so this plane becomes level (normal → +Z), about the plane centroid?")) return; const R = levelTo(r.n); const c = r.c; applyTransformToJob(job, R, [c[0] - (R[0][0] * c[0] + R[0][1] * c[1] + R[0][2] * c[2]), c[1] - (R[1][0] * c[0] + R[1][1] * c[1] + R[1][2] * c[2]), c[2] - (R[2][0] * c[0] + R[2][1] * c[1] + R[2][2] * c[2])]); toast("Job levelled"); };
+        $("#lvl", opts).onclick = async () => { if (!await confirmBox("Rotate ALL job points so this plane becomes level (normal → +Z), about the plane centroid?")) return; const R = levelTo(r.n); const c = r.c; applyTransformToJob(job, R, [c[0] - (R[0][0] * c[0] + R[0][1] * c[1] + R[0][2] * c[2]), c[1] - (R[1][0] * c[0] + R[1][1] * c[1] + R[1][2] * c[2]), c[2] - (R[2][0] * c[0] + R[2][1] * c[1] + R[2][2] * c[2])]); toast("Job levelled"); };
         $(".sv", out.el).onclick = () => saveFit("plane", `Plane (${P.length} pts)`, { points: pk.names() }, { n: r.n, c: r.c, rms: r.rms, pitchDeg: r.pitchDeg, rollDeg: r.rollDeg, residuals: r.residuals }, rep);
       } catch (e: any) { out.error(e.message); }
     };
@@ -313,7 +330,7 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
       out.table(tableHTML(["Point", "Offset from line", ""], P.map((p, i) => [p.name, f(r.residuals[i]), pill(flagOf(r.residuals[i]))])));
       const rep = [stamp(), "Line fit (principal axis)", "", `Through  ${r.c.map(v => f(v)).join("  ")}`, `Direction ${r.dir.map(v => v.toFixed(7)).join("  ")}  bearing ${fa(bearing)}  slope ${fa(slope)}`, "", ...P.map((p, i) => `  ${p.name.padEnd(10)}${f(r.residuals[i]).padStart(10)}`), "", `Straightness RMS ${f(r.rms)} ${job.units}`].join("\n");
       out.report(rep); out.error(""); out.plot({ pts: P.map(p => p.p), names: P.map(p => p.name), residuals: r.residuals, tol: job.tolerance, unitFactor: unitF() });
-      $(".sv", out.el).onclick = () => saveFit("line", `Line (${P.length} pts)`, { points: pk.names() }, { c: r.c, dir: r.dir, rms: r.rms }, rep);
+      $(".sv", out.el).onclick = () => saveFit("line", `Line (${P.length} pts)`, { points: pk.names() }, { c: r.c, dir: r.dir, rms: r.rms, half: Math.max(...P.map(p => Math.hypot(p.p[0] - r.c[0], p.p[1] - r.c[1], p.p[2] - r.c[2]))) }, rep);
     } catch (e: any) { out.error(e.message); } };
   },
 
@@ -332,20 +349,20 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
 
   flange(w) {
     const holes = pointPicker("Bolt-hole centres (one per hole)"), face = pointPicker("Flange face points (optional, for flatness and face offset)");
-    const opts = el(`<section class="panel"><div class="opts"><label>Holes <input type="number" id="n" value="8" min="3" step="1" style="width:64px"></label><label>Nominal PCD (${job.units}) <input type="number" id="pcd" step="0.1" value="203.2"></label><label>Design axis <select id="axis"><option value="x">X / E</option><option value="y">Y / N</option><option value="z" selected>Z / up</option></select></label><label>Centre point name <input type="text" id="cn" value="FL1" style="width:80px"></label></div>
+    const opts = el(`<section class="panel"><div class="opts"><label>Holes <input type="number" id="n" value="8" min="3" step="1" style="width:64px"></label><label>Nominal PCD (${job.units}) <input type="number" id="pcd" step="0.1" value="203.2"></label><label>Design axis <select id="axis"><option value="auto" selected>auto (nearest to face normal)</option><option value="x">X / E</option><option value="y">Y / N</option><option value="z">Z / up</option></select></label><label>Centre point name <input type="text" id="cn" value="FL1" style="width:80px"></label></div>
       <div class="actions"><button class="btn primary" id="run">Compute</button><button class="btn" id="add" disabled>Add flange centre to job</button></div></section>`);
     const out = resultPanel("Flange result"); const row = el(`<div class="row"></div>`); row.append(holes.el, face.el); w.append(row, opts, out.el);
     $("#run", opts).onclick = () => { try {
-      const H = pointsByName(holes.names()), F = pointsByName(face.names()); const nH = +($("#n", opts) as HTMLInputElement).value, pcd = fromUnits(+($("#pcd", opts) as HTMLInputElement).value, job.units), axis = ($("#axis", opts) as HTMLSelectElement).value as "x" | "y" | "z";
+      const H = pointsByName(holes.names()), F = pointsByName(face.names()); const nH = +($("#n", opts) as HTMLInputElement).value, pcd = fromUnits(+($("#pcd", opts) as HTMLInputElement).value, job.units), axis = ($("#axis", opts) as HTMLSelectElement).value as "x" | "y" | "z" | "auto";
       const r = flangeFit(H.map(p => p.p), { nHoles: nH, nominalPCD: pcd, axis, facePoints: F.length >= 3 ? F.map(p => p.p) : undefined });
-      const rows = H.map((p, i) => [p.name, f(r.circle.residuals[i]), f(r.circle.planeResiduals[i]), r.holeAngles[i].toFixed(3), pill(flagOf(r.circle.residuals[i]))]);
-      out.stats([["PCD measured", f(r.pcd)], ["PCD error", f(r.pcdError)], ["Face angle to axis", fa(r.faceAngleDeg)], ["Pitch", fa(r.pitchDeg)], ["Roll", fa(r.rollDeg)], ["Hole spacing err", fa(r.maxSpacingErrorDeg)], ["Radial RMS", f(r.circle.rms)], ...(r.face ? [["Face flatness RMS", f(r.face.rms)] as [string, string], ["Holes→face offset", f(r.faceToHolesGapMm!)] as [string, string]] : [])]);
-      out.table(tableHTML(["Hole", "Radial dev", "Out-of-plane", "Angle °", ""], rows));
-      const rep = [stamp(), `Flange: ${nH} holes, nominal PCD ${f(pcd)}`, "", `Centre      ${r.circle.center.map(v => f(v)).join("  ")}`, `PCD         ${f(r.pcd)}  (error ${r.pcdError >= 0 ? "+" : ""}${f(r.pcdError)})`, `Normal      ${r.circle.n.map(v => v.toFixed(7)).join("  ")}`, `Face angle to ${axis.toUpperCase()} axis ${fa(r.faceAngleDeg)}   pitch ${fa(r.pitchDeg)}   roll ${fa(r.rollDeg)}`, `Hole spacing nominal ${r.nominalSpacingDeg.toFixed(3)}°, max deviation ${fa(r.maxSpacingErrorDeg)}`, ...(r.face ? [`Face flatness RMS ${f(r.face.rms)}  holes-to-face offset ${f(r.faceToHolesGapMm!)}`] : []), "", "Hole      radial  out-of-plane   angle", ...rows.map(rw => "  " + rw[0].padEnd(10) + rw[1].padStart(9) + rw[2].padStart(12) + rw[3].padStart(10) + (rw[4].includes("bad") ? "  OUT" : ""))].join("\n");
+      const rows = H.map((p, i) => [p.name, f(r.circle.residuals[i]), f(r.circle.planeResiduals[i]), r.clockDeg[i].toFixed(3), pill(flagOf(r.circle.residuals[i]))]);
+      out.stats([["PCD measured", f(r.pcd)], ["PCD error", f(r.pcdError)], ["Face angle to axis", fa(r.faceAngleDeg)], ...(r.axis === "z" ? [["Pitch", fa(r.pitchDeg)], ["Roll", fa(r.rollDeg)]] : [["Tilt up/down", fa(r.tiltDeg)], ["Skew in plan", fa(r.skewDeg)]]) as [string, string][], ["Hole spacing err", fa(r.maxSpacingErrorDeg)], ["Two-hole rotation", fa(r.twoHoleErrorDeg)], ["…at PCD", f(r.twoHoleErrorArc)], ["Radial RMS", f(r.circle.rms)], ...(r.face ? [["Face flatness RMS", f(r.face.rms)] as [string, string], ["Holes→face offset", f(r.faceToHolesGapMm!)] as [string, string]] : [])]);
+      out.table(tableHTML(["Hole", "Radial dev", "Out-of-plane", `Clock ° from ${r.clockReference}`, ""], rows));
+      const rep = [stamp(), `Flange: ${nH} holes, nominal PCD ${f(pcd)}`, "", `Centre      ${r.circle.center.map(v => f(v)).join("  ")}`, `PCD         ${f(r.pcd)}  (error ${r.pcdError >= 0 ? "+" : ""}${f(r.pcdError)})`, `Normal      ${r.normal.map(v => v.toFixed(7)).join("  ")}`, `Face angle to ${r.axis.toUpperCase()} axis ${fa(r.faceAngleDeg)}   ${r.axis === "z" ? `pitch ${fa(r.pitchDeg)}   roll ${fa(r.rollDeg)}` : `tilt up/down ${fa(r.tiltDeg)}   skew in plan ${fa(r.skewDeg)}`}`, `Hole spacing nominal ${r.nominalSpacingDeg.toFixed(3)}°, max deviation ${fa(r.maxSpacingErrorDeg)}`, `Two-holing: pattern is rotated ${fa(r.twoHoleErrorDeg)} (${f(r.twoHoleErrorArc)} ${job.units} at the PCD) from straddling the ${r.clockReference === "up" ? "vertical" : "north-south"} centreline`, `  clock angles from ${r.clockReference}, anticlockwise seen with the face normal (+${r.axis.toUpperCase()} side) toward the viewer`, ...(r.face ? [`Face flatness RMS ${f(r.face.rms)}  holes-to-face offset ${f(r.faceToHolesGapMm!)}`] : []), "", "Hole      radial  out-of-plane   clock", ...rows.map(rw => "  " + rw[0].padEnd(10) + rw[1].padStart(9) + rw[2].padStart(12) + rw[3].padStart(10) + (rw[4].includes("bad") ? "  OUT" : ""))].join("\n");
       out.report(rep); out.error(""); out.plot({ pts: H.map(p => p.p), names: H.map(p => p.name), residuals: r.circle.residuals, circle: { center: r.circle.center, r: r.circle.r, u: r.circle.u, v: r.circle.v }, tol: job.tolerance, unitFactor: unitF() });
       ($("#add", opts) as HTMLButtonElement).disabled = false;
       $("#add", opts).onclick = () => { upsertPoints(job, [{ name: ($("#cn", opts) as HTMLInputElement).value, p: r.circle.center, source: "fit", code: "FLANGE CENTRE" }], "rename"); toast("Flange centre added"); refreshStatus(); };
-      $(".sv", out.el).onclick = () => saveFit("flange", `Flange ${nH}×, PCD ${f(r.pcd)}`, { holes: holes.names(), face: face.names(), nH, pcd, axis }, { center: r.circle.center, n: r.circle.n, pcd: r.pcd, pcdError: r.pcdError, faceAngleDeg: r.faceAngleDeg, pitchDeg: r.pitchDeg, rollDeg: r.rollDeg, holeAngles: r.holeAngles }, rep);
+      $(".sv", out.el).onclick = () => saveFit("flange", `Flange ${nH}×, PCD ${f(r.pcd)}`, { holes: holes.names(), face: face.names(), nH, pcd, axis }, { center: r.circle.center, n: r.normal, pcd: r.pcd, pcdError: r.pcdError, faceAngleDeg: r.faceAngleDeg, pitchDeg: r.pitchDeg, rollDeg: r.rollDeg, holeAngles: r.holeAngles, clockDeg: r.clockDeg, twoHoleErrorDeg: r.twoHoleErrorDeg, twoHoleErrorArc: r.twoHoleErrorArc }, rep);
     } catch (e: any) { out.error(e.message); } };
   },
 
@@ -358,7 +375,7 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
     const out = resultPanel("Transform preview"); w.append(pk.el, opts, out.el);
     const params = () => { const v = (id: string) => +($(`#${id}`, opts) as HTMLInputElement).value; const names = pk.names().length ? pk.names() : job.points.map(p => p.name); const P = pointsByName(names); const ab = ($("#about", opts) as HTMLSelectElement).value; let pivot: Vec3 = [0, 0, 0]; if (ab === "centroid") pivot = centroid(P.map(p => p.p)); if (ab === "point") { const q = job.points.find(p => p.name === ($("#aboutPt", opts) as HTMLInputElement).value); if (!q) throw new Error("Pivot point not found"); pivot = q.p; } return { P, names, R: rotZYX(v("rx"), v("ry"), v("rz")), t: [fromUnits(v("tx"), job.units), fromUnits(v("ty"), job.units), fromUnits(v("tz"), job.units)] as Vec3, s: v("s"), pivot }; };
     $("#preview", opts).onclick = () => { try { const q = params(); const after = transformPoints(q.P.map(p => p.p), q); out.stats([["Points", q.P.length], ["Pivot", q.pivot.map(v => f(v, 1)).join(", ")]]); out.table(tableHTML(["Point", "E", "N", "H", "→ E", "→ N", "→ H"], q.P.map((p, i) => [p.name, f(p.p[0]), f(p.p[1]), f(p.p[2]), f(after[i][0]), f(after[i][1]), f(after[i][2])]))); out.report([stamp(), "Transform  out = s·R·(p − pivot) + pivot + t", `t ${q.t.map(v => f(v)).join("  ")}  rot ${eulerZYX(q.R).map(fa).join(" ")}  s ${q.s}  pivot ${q.pivot.map(v => f(v)).join("  ")}`, "", ...q.P.map((p, i) => `${p.name.padEnd(10)}${after[i].map(v => f(v).padStart(12)).join("")}`)].join("\n")); out.error(""); out.plot({ pts: q.P.map(p => p.p), names: q.P.map(p => p.name), after, tol: job.tolerance, unitFactor: unitF() }); } catch (e: any) { out.error(e.message); } };
-    $("#apply", opts).onclick = () => { try { const q = params(); if (!window.confirm(`Transform ${q.P.length} point(s) in the job?`)) return; const tEff: Vec3 = [q.pivot[0] - q.s * (q.R[0][0] * q.pivot[0] + q.R[0][1] * q.pivot[1] + q.R[0][2] * q.pivot[2]) + q.t[0], q.pivot[1] - q.s * (q.R[1][0] * q.pivot[0] + q.R[1][1] * q.pivot[1] + q.R[1][2] * q.pivot[2]) + q.t[1], q.pivot[2] - q.s * (q.R[2][0] * q.pivot[0] + q.R[2][1] * q.pivot[1] + q.R[2][2] * q.pivot[2]) + q.t[2]]; applyTransformToJob(job, q.R, tEff, q.s, q.names); toast("Applied"); show("transform"); } catch (e: any) { out.error(e.message); } };
+    $("#apply", opts).onclick = async () => { try { const q = params(); if (!await confirmBox(`Transform ${q.P.length} point(s) in the job?`)) return; const tEff: Vec3 = [q.pivot[0] - q.s * (q.R[0][0] * q.pivot[0] + q.R[0][1] * q.pivot[1] + q.R[0][2] * q.pivot[2]) + q.t[0], q.pivot[1] - q.s * (q.R[1][0] * q.pivot[0] + q.R[1][1] * q.pivot[1] + q.R[1][2] * q.pivot[2]) + q.t[1], q.pivot[2] - q.s * (q.R[2][0] * q.pivot[0] + q.R[2][1] * q.pivot[1] + q.R[2][2] * q.pivot[2]) + q.t[2]]; applyTransformToJob(job, q.R, tEff, q.s, q.names); toast("Applied"); show("transform"); } catch (e: any) { out.error(e.message); } };
   },
 
   level(w) {
@@ -371,24 +388,26 @@ const RENDER: Record<string, (w: HTMLElement) => void> = {
       out.stats([["Rot X (roll)", fa(e[0])], ["Rot Y (pitch)", fa(e[1])], ["Rot Z", fa(e[2])], ["Pivot", piv.map(v => f(v, 1)).join(", ")]]); out.table("");
       out.report([stamp(), `Pitch & roll: rotate so the ${kind === "plane" ? "plane normal" : "axis"} ${vec.map(v => v.toFixed(6)).join(" ")} → ${target.join(" ")}`, `Rotation X/Y/Z ${e.map(fa).join("  ")} about pivot ${piv.map(v => f(v)).join("  ")}`, "R " + R.map(row => "[" + row.map(v => v.toFixed(7)).join(" ") + "]").join("\n  ")].join("\n")); out.error(""); ($("#apply", opts) as HTMLButtonElement).disabled = false;
     } catch (e: any) { out.error(e.message); } };
-    $("#apply", opts).onclick = () => { if (!R || !window.confirm("Rotate every point in the job?")) return; const c = piv; applyTransformToJob(job, R, [c[0] - (R[0][0] * c[0] + R[0][1] * c[1] + R[0][2] * c[2]), c[1] - (R[1][0] * c[0] + R[1][1] * c[1] + R[1][2] * c[2]), c[2] - (R[2][0] * c[0] + R[2][1] * c[1] + R[2][2] * c[2])]); toast("Job rotated"); show("level"); };
+    $("#apply", opts).onclick = async () => { if (!R || !await confirmBox("Rotate every point in the job?")) return; const c = piv; applyTransformToJob(job, R, [c[0] - (R[0][0] * c[0] + R[0][1] * c[1] + R[0][2] * c[2]), c[1] - (R[1][0] * c[0] + R[1][1] * c[1] + R[1][2] * c[2]), c[2] - (R[2][0] * c[0] + R[2][1] * c[1] + R[2][2] * c[2])]); toast("Job rotated"); show("level"); };
   },
 
   cad(w) {
     const box = el(`<section class="panel"><h2>Plot to CAD <span class="hint">DXF R12 — opens in AutoCAD, BricsCAD, MicroStation, Navisworks</span></h2>
-      <div class="opts"><label><input type="checkbox" id="pts" checked> Points with labels</label><label><input type="checkbox" id="fits" checked> Saved fits (circles, plane centroids, normals)</label><label><input type="checkbox" id="res" checked> Residual vectors (×<input type="number" id="ex" value="100" style="width:70px">)</label><label>Units in file <select id="u"><option value="m">metres</option><option value="mm">millimetres</option></select></label><label>Marker size <input type="number" id="ms" value="0.02" step="0.005"></label></div>
+      <div class="opts"><label><input type="checkbox" id="pts" checked> Points with labels</label><label><input type="checkbox" id="fits" checked> Saved fits (circles, cylinders, spheres, planes, lines)</label><label><input type="checkbox" id="res" checked> Residual vectors (×<input type="number" id="ex" value="100" style="width:70px">)</label><label>Units in file <select id="u"><option value="m">metres</option><option value="mm">millimetres</option></select></label><label>Marker size <input type="number" id="ms" value="0.02" step="0.005"></label></div>
       <div class="actions"><button class="btn primary" id="go">Write DXF…</button></div>
-      <div class="note">Layers: POINTS, LABELS, FIT_CIRCLE, FIT_PLANE, FIT_LINE, RESIDUALS. Point marks are 3D crosses so they survive in Navisworks.</div></section>`);
+      <div class="note">Layers: POINTS, FIT_CIRCLE, FIT_PLANE, FIT_LINE, FIT_CYLINDER, FIT_SPHERE, RESIDUALS. Point marks are 3D crosses so they survive in Navisworks.</div></section>`);
     w.append(box);
     $("#go", box).onclick = async () => {
       const mm = ($("#u", box) as HTMLSelectElement).value === "mm", k = mm ? 1000 : 1, S = (p: Vec3): Vec3 => [p[0] * k, p[1] * k, p[2] * k], ms = +($("#ms", box) as HTMLInputElement).value * k, ex = +($("#ex", box) as HTMLInputElement).value;
-      const d = new DxfWriter().layer("POINTS", 7).layer("LABELS", 8).layer("FIT_CIRCLE", 1).layer("FIT_PLANE", 3).layer("FIT_LINE", 5).layer("RESIDUALS", 2);
+      const d = new DxfWriter().layer("POINTS", 7).layer("LABELS", 8).layer("FIT_CIRCLE", 1).layer("FIT_PLANE", 3).layer("FIT_LINE", 5).layer("FIT_CYLINDER", 6).layer("FIT_SPHERE", 4).layer("RESIDUALS", 2);
       if (($("#pts", box) as HTMLInputElement).checked) for (const p of job.points) d.labelledPoint(S(p.p), p.name, ms, "POINTS");
       if (($("#fits", box) as HTMLInputElement).checked) for (const ft of job.fits) {
         const r = ft.result as any;
         if (ft.kind === "circle" || ft.kind === "flange") { d.circle(S(r.center), (r.r ?? r.pcd / 2) * k, r.n, "FIT_CIRCLE"); d.labelledPoint(S(r.center), ft.title, ms, "FIT_CIRCLE"); d.line(S(r.center), S([r.center[0] + r.n[0] * 0.2, r.center[1] + r.n[1] * 0.2, r.center[2] + r.n[2] * 0.2]), "FIT_CIRCLE"); }
         if (ft.kind === "plane") { const pts = pointsByName((ft.inputs as any).points as string[]); if (pts.length >= 3) { const c = S(r.c), n = r.n as Vec3; d.line(c, [c[0] + n[0] * 0.3 * k, c[1] + n[1] * 0.3 * k, c[2] + n[2] * 0.3 * k], "FIT_PLANE"); for (let i = 0; i < pts.length; i++) d.line(S(pts[i].p), S(pts[(i + 1) % pts.length].p), "FIT_PLANE"); } }
         if (ft.kind === "line") { const c = r.c as Vec3, v = r.dir as Vec3; d.line(S([c[0] - v[0], c[1] - v[1], c[2] - v[2]]), S([c[0] + v[0], c[1] + v[1], c[2] + v[2]]), "FIT_LINE"); }
+        if (ft.kind === "cylinder") { d.circle(S(r.end1), r.r * k, r.dir, "FIT_CYLINDER").circle(S(r.end2), r.r * k, r.dir, "FIT_CYLINDER").line(S(r.end1), S(r.end2), "FIT_CYLINDER"); d.labelledPoint(S(r.point), ft.title, ms, "FIT_CYLINDER"); }
+        if (ft.kind === "sphere") { for (const nn of [[1, 0, 0], [0, 1, 0], [0, 0, 1]] as Vec3[]) d.circle(S(r.center), r.r * k, nn, "FIT_SPHERE"); d.labelledPoint(S(r.center), ft.title, ms, "FIT_SPHERE"); }
         if (ft.kind === "corner") d.labelledPoint(S(r.point), ft.title, ms, "FIT_LINE");
         if ((ft.kind === "bestfit3d" || ft.kind === "bestfit2d") && ($("#res", box) as HTMLInputElement).checked) { const des = pointsByName((ft.inputs as any).design as string[]); (r.residuals as Vec3[]).forEach((rv, i) => { const p = des[i]; if (!p) return; const q = S(p.p); d.line(q, [q[0] + rv[0] * ex * k, q[1] + rv[1] * ex * k, q[2] + rv[2] * ex * k], "RESIDUALS"); }); }
       }
@@ -409,11 +428,11 @@ function nextName() { const nums = job.points.map(p => parseInt(p.name.replace(/
 /** Resection: measure 3+ known points from an unknown station; solve station by best-fit. */
 async function resectionDialog(err: (m: string) => void) {
   if (!client) return err("Connect first");
-  const names = expandNames(window.prompt("Known job points to observe (e.g. TP1-TP4)") ?? ""); const known = pointsByName(names);
+  const names = expandNames((await promptBox("Known job points to observe (e.g. TP1-TP4)")) ?? ""); const known = pointsByName(names);
   if (known.length < 3) return err("Need 3 or more known points");
   const local: Vec3[] = [];
   for (const k of known) {
-    if (!window.confirm(`Aim at ${k.name} and press OK to measure`)) return;
+    if (!await confirmBox(`Aim at ${k.name} and press OK to measure`)) return;
     try { const m = await client.measure(); const v = m.v * Math.PI / 180, hz = m.hz * Math.PI / 180, hd = m.sd * Math.sin(v); local.push([hd * Math.sin(hz), hd * Math.cos(hz), m.sd * Math.cos(v)]); } catch (e: any) { return err(e.message); }
   }
   // local frame → job frame: rotation about Z only + translation (instrument assumed levelled)
@@ -421,8 +440,122 @@ async function resectionDialog(err: (m: string) => void) {
   const dz = known.reduce((s, k, i) => s + (k.p[2] - local[i][2]), 0) / known.length;
   const st: Vec3 = [r.t[0], r.t[1], dz];
   const ori = r.rotXYZ[2];
-  if (!window.confirm(`Station solved: E ${f(st[0])}  N ${f(st[1])}  H ${f(st[2])} (incl. hi)   orientation +${fa(ori)}   RMS ${f(r.rms)} ${job.units}\nSend to instrument?`)) return;
+  if (!await confirmBox(`Station solved: E ${f(st[0])}  N ${f(st[1])}  H ${f(st[2])} (incl. hi)   orientation +${fa(ori)}   RMS ${f(r.rms)} ${job.units}\nSend to instrument?`)) return;
   try { await client.setStation(st[0], st[1], st[2], 0); const a = await client.angles(); await client.setOrientation(((a.hz + ori) % 360 + 360) % 360); toast("Station set from resection"); } catch (e: any) { err(e.message); }
 }
+
+
+// ---------- screens added in 0.2 ----------
+function circlePoly(c: Vec3, r: number, n: Vec3, segs = 72): Vec3[] {
+  const u = unit(cross(n, Math.abs(n[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0])), v = cross(n, u);
+  return Array.from({ length: segs }, (_, i) => { const a = (i / segs) * 2 * Math.PI; return add(c, add(scl(u, r * Math.cos(a)), scl(v, r * Math.sin(a)))); });
+}
+function buildScene(withFits: boolean): Scene3D {
+  const s: Scene3D = { points: job.points.map(p => ({ name: p.name, p: p.p, selected: selected.has(p.name), derived: p.source === "fit" })), polylines: [] };
+  if (!withFits) return s;
+  for (const ft of job.fits) {
+    const r = ft.result as any;
+    if (ft.kind === "circle" || ft.kind === "flange") { const rad = r.r ?? r.pcd / 2; s.polylines.push({ pts: circlePoly(r.center, rad, r.n), closed: true }, { pts: [r.center, add(r.center, scl(r.n, rad))], dashed: true }); }
+    if (ft.kind === "cylinder") {
+      const c1 = circlePoly(r.end1, r.r, r.dir, 48), c2 = circlePoly(r.end2, r.r, r.dir, 48);
+      s.polylines.push({ pts: c1, closed: true }, { pts: c2, closed: true }, { pts: [r.end1, r.end2], dashed: true });
+      for (let i = 0; i < 48; i += 6) s.polylines.push({ pts: [c1[i], c2[i]] });
+    }
+    if (ft.kind === "sphere") for (const n of [[1, 0, 0], [0, 1, 0], [0, 0, 1]] as Vec3[]) s.polylines.push({ pts: circlePoly(r.center, r.r, n), closed: true });
+    if (ft.kind === "plane") { const pts = pointsByName((ft.inputs as any).points as string[]).map(p => p.p); if (pts.length >= 3) { const ang = pts.map(p => Math.atan2(p[1] - r.c[1], p[0] - r.c[0])); const order = pts.map((_, i) => i).sort((a, b) => ang[a] - ang[b]); s.polylines.push({ pts: order.map(i => pts[i]), closed: true }, { pts: [r.c, add(r.c, scl(r.n, 0.3))], dashed: true }); } }
+    if (ft.kind === "line") s.polylines.push({ pts: [add(r.c, scl(r.dir, -(r.half ?? 0.5))), add(r.c, scl(r.dir, r.half ?? 0.5))] });
+  }
+  return s;
+}
+
+RENDER.view3d = (w) => {
+  const box = el(`<section class="panel"><h2>3D view <span class="hint">drag to orbit · Shift-drag or right-drag to pan · wheel to zoom · double-click to fit</span></h2>
+    <div class="viewbar"><button class="btn" data-v="iso">Iso</button><button class="btn" data-v="plan">Plan</button><button class="btn" data-v="north">Looking north</button><button class="btn" data-v="east">Looking east</button><button class="btn" id="fitAll">Fit all</button><button class="btn" id="fitSel">Zoom to selection</button>
+    <label><input type="checkbox" id="lbl" checked> Labels</label><label><input type="checkbox" id="fitsOn" checked> Saved fits</label><span class="readout" id="hover"></span></div>
+    <canvas class="v3d" id="v3d"></canvas></section>`);
+  w.append(box);
+  const view = new View3D($("#v3d", box) as HTMLCanvasElement, buildScene(true), m => f(m), job.units, unitF());
+  view.onHover = t => { $("#hover", box).textContent = t; };
+  box.querySelectorAll<HTMLButtonElement>("[data-v]").forEach(b => (b.onclick = () => view.preset(b.dataset.v as any)));
+  $("#fitAll", box).onclick = () => { view.fit(); view.draw(); };
+  $("#fitSel", box).onclick = () => { const pts = job.points.filter(p => selected.has(p.name)).map(p => p.p); if (!pts.length) return toast("Select points on the Job screen first"); view.focus(pts); };
+  ($("#lbl", box) as HTMLInputElement).onchange = e => { view.labels = (e.target as HTMLInputElement).checked; view.draw(); };
+  ($("#fitsOn", box) as HTMLInputElement).onchange = e => { view.scene = buildScene((e.target as HTMLInputElement).checked); view.draw(); };
+  view.draw();
+};
+
+RENDER.cylinder = (w) => {
+  const pk = pointPicker("Points on the pipe / vessel / pedestal surface (5 or more, spread along and around it)");
+  const opts = el(`<section class="panel"><div class="opts"><label><input type="checkbox" id="fixR"> Fixed radius</label><label>R (${job.units}) <input type="number" id="R" step="0.01" value="${f(0.10955, 2)}"></label><label>Name for axis points <input type="text" id="cn" value="PIPE1" style="width:90px"></label></div>
+    <div class="actions"><button class="btn primary" id="run">Compute</button><button class="btn" id="add" disabled>Add axis end points to job</button></div><div class="note">Shots on one side of the pipe are enough. With a short arc, fix the radius to the known OD for a steadier axis.</div></section>`);
+  const out = resultPanel("Cylinder fit result"); w.append(pk.el, opts, out.el);
+  $("#run", opts).onclick = () => {
+    try {
+      const P = pointsByName(pk.names()); const fixR = ($("#fixR", opts) as HTMLInputElement).checked ? fromUnits(+($("#R", opts) as HTMLInputElement).value, job.units) : undefined;
+      const r = cylinderFit(P.map(p => p.p), fixR);
+      const rows = P.map((p, i) => [p.name, f(r.residuals[i]), f(r.chainage[i]), pill(flagOf(r.residuals[i]))]);
+      out.stats([["Points", P.length], ["Diameter", f(2 * r.r)], ["Radius", f(r.r)], ["Radial RMS", f(r.rms)], ["Max |dev|", f(Math.max(...r.residuals.map(Math.abs)))], ["Measured length", f(r.length)], ["Bearing", fa(r.bearingDeg)], ["Slope", fa(r.slopeDeg)], ["Off vertical", fa(r.tiltFromVerticalDeg)]]);
+      out.table(tableHTML(["Point", "Radial dev", "Along axis", ""], rows));
+      const rep = [stamp(), `Cylinder fit (${fixR ? "fixed radius, " : ""}geometric least squares)`, "", `Axis point  ${r.point.map(v => f(v)).join("  ")}`, `Axis dir    ${r.dir.map(v => v.toFixed(7)).join("  ")}`, `Bearing ${fa(r.bearingDeg)}   slope ${fa(r.slopeDeg)}   off vertical ${fa(r.tiltFromVerticalDeg)}`, `Radius ${f(r.r)}   Diameter ${f(2 * r.r)}${fixR ? " (fixed)" : ""}`, `Axis end 1  ${r.end1.map(v => f(v)).join("  ")}`, `Axis end 2  ${r.end2.map(v => f(v)).join("  ")}   length ${f(r.length)}`, "", "Point      radial   along axis", ...rows.map(rw => "  " + rw[0].padEnd(10) + rw[1].padStart(9) + rw[2].padStart(12) + (rw[3].includes("bad") ? "  OUT" : "")), "", `Radial RMS ${f(r.rms)} ${job.units}`].join("\n");
+      out.report(rep); out.error("");
+      out.plot({ pts: P.map(p => p.p), names: P.map(p => p.name), residuals: r.residuals, circle: { center: r.point, r: r.r, u: r.u, v: r.v }, tol: job.tolerance, unitFactor: unitF() });
+      ($("#add", opts) as HTMLButtonElement).disabled = false;
+      $("#add", opts).onclick = () => { const n = ($("#cn", opts) as HTMLInputElement).value || "PIPE"; upsertPoints(job, [{ name: n + "_A", p: r.end1, source: "fit", code: "CYL AXIS" }, { name: n + "_B", p: r.end2, source: "fit", code: "CYL AXIS" }], "rename"); toast(`Added ${n}_A and ${n}_B`); refreshStatus(); };
+      $(".sv", out.el).onclick = () => saveFit("cylinder", `Cylinder Ø${f(2 * r.r)} (${P.length} pts)`, { points: pk.names(), fixR }, { point: r.point, dir: r.dir, r: r.r, end1: r.end1, end2: r.end2, rms: r.rms, residuals: r.residuals }, rep);
+    } catch (e: any) { out.error(e.message); }
+  };
+};
+
+RENDER.sphere = (w) => {
+  const pk = pointPicker("Points on the sphere surface (4 or more)");
+  const opts = el(`<section class="panel"><div class="opts"><label><input type="checkbox" id="fixR"> Fixed radius</label><label>R (${job.units}) <input type="number" id="R" step="0.01" value="${f(0.0725, 2)}"></label><label>Centre point name <input type="text" id="cn" value="SPH1" style="width:90px"></label></div>
+    <div class="actions"><button class="btn primary" id="run">Compute</button><button class="btn" id="add" disabled>Add centre point to job</button></div></section>`);
+  const out = resultPanel("Sphere fit result"); w.append(pk.el, opts, out.el);
+  $("#run", opts).onclick = () => {
+    try {
+      const P = pointsByName(pk.names()); const fixR = ($("#fixR", opts) as HTMLInputElement).checked ? fromUnits(+($("#R", opts) as HTMLInputElement).value, job.units) : undefined;
+      const r = sphereFit(P.map(p => p.p), fixR);
+      const rows = P.map((p, i) => [p.name, f(r.residuals[i]), pill(flagOf(r.residuals[i]))]);
+      out.stats([["Points", P.length], ["Diameter", f(2 * r.r)], ["Radius", f(r.r)], ["RMS", f(r.rms)], ["Centre E", f(r.center[0])], ["Centre N", f(r.center[1])], ["Centre H", f(r.center[2])]]);
+      out.table(tableHTML(["Point", "Radial dev", ""], rows));
+      const rep = [stamp(), `Sphere fit (${fixR ? "fixed radius, " : ""}geometric least squares)`, "", `Centre  ${r.center.map(v => f(v)).join("  ")}`, `Radius  ${f(r.r)}   Diameter ${f(2 * r.r)}${fixR ? " (fixed)" : ""}`, "", ...rows.map(rw => "  " + rw[0].padEnd(10) + rw[1].padStart(10) + (rw[2].includes("bad") ? "  OUT" : "")), "", `RMS ${f(r.rms)} ${job.units}`].join("\n");
+      out.report(rep); out.error(""); out.plot({ pts: P.map(p => p.p), names: P.map(p => p.name), residuals: r.residuals, tol: job.tolerance, unitFactor: unitF() });
+      ($("#add", opts) as HTMLButtonElement).disabled = false;
+      $("#add", opts).onclick = () => { const n = ($("#cn", opts) as HTMLInputElement).value || "SPH"; upsertPoints(job, [{ name: n, p: r.center, source: "fit", code: "SPHERE CENTRE" }], "rename"); toast(`Added ${n}`); refreshStatus(); };
+      $(".sv", out.el).onclick = () => saveFit("sphere", `Sphere Ø${f(2 * r.r)} (${P.length} pts)`, { points: pk.names(), fixR }, { center: r.center, r: r.r, rms: r.rms, residuals: r.residuals }, rep);
+    } catch (e: any) { out.error(e.message); }
+  };
+};
+
+RENDER.cogo = (w) => {
+  const optsHtml = `<option value="">—</option>` + job.points.map(p => `<option value="${p.name}">${p.name}</option>`).join("");
+  const pick = el(`<section class="panel"><h2>Points <span class="hint">fill in what the calculation needs; the rest can stay blank</span></h2><div class="kv tight">
+    <label>A (from / line start)<select id="cA">${optsHtml}</select></label><label>B (to / line end)<select id="cB">${optsHtml}</select></label>
+    <label>P (point to check)<select id="cP">${optsHtml}</select></label><label>C (second line start)<select id="cC">${optsHtml}</select></label><label>D (second line end)<select id="cD">${optsHtml}</select></label></div></section>`);
+  const plane = pointPicker("Plane points for P-to-plane offset (optional, 3 or more)");
+  const act = el(`<section class="panel"><div class="actions"><button class="btn primary" id="run">Compute</button><button class="btn" id="addFoot" disabled>Add foot of P on A–B</button><button class="btn" id="addX" disabled>Add A–B × C–D intersection</button><button class="btn" id="cp" disabled>Copy</button></div><div class="err" hidden></div></section>`);
+  const res = el(`<section class="panel"><h2>Result</h2><pre class="rep">Pick A and B for an inverse. Add P for chainage and offset from the line A–B. Add C and D for the intersection of two lines. Select plane points for the offset of P from a fitted plane.</pre></section>`);
+  w.append(pick, plane.el, act, res);
+  const get = (id: string) => job.points.find(p => p.name === ($(`#${id}`, pick) as HTMLSelectElement).value);
+  $("#run", act).onclick = () => {
+    const errEl = $(".err", act); errEl.hidden = true;
+    try {
+      const A = get("cA"), B = get("cB"), P = get("cP"), C = get("cC"), D = get("cD"), lines: string[] = [stamp(), ""];
+      let foot: Vec3 | null = null, X: Vec3 | null = null;
+      if (A && B) { const r = inverse(A.p, B.p); lines.push(`INVERSE ${A.name} → ${B.name}`, `  dE ${f(r.dE)}   dN ${f(r.dN)}   dH ${f(r.dH)}`, `  horizontal ${f(r.horiz)}   slope ${f(r.slope)} ${job.units}`, `  bearing ${fa(r.bearingDeg)}   zenith ${fa(r.zenithDeg)}   grade ${isNaN(r.gradePct) ? "—" : r.gradePct.toFixed(3) + " %"}`, ""); }
+      if (A && B && P) { const r = pointToLine(P.p, A.p, B.p); foot = r.foot; lines.push(`POINT ${P.name} TO LINE ${A.name}–${B.name}`, `  chainage from ${A.name} ${f(r.chainage)}   offset ${f(r.offset)} (3D)`, `  horizontal offset ${f(Math.abs(r.horizOffset))} ${r.horizOffset >= 0 ? "right" : "left"} of line   height above line ${f(r.dH)}`, `  foot ${r.foot.map(v => f(v)).join("  ")}`, ""); }
+      if (A && B && C && D) { const r = lineLine(A.p, B.p, C.p, D.p); X = r.point; lines.push(`LINES ${A.name}–${B.name} AND ${C.name}–${D.name}`, `  closest approach ${f(r.gap)} ${job.units} apart   angle between ${fa(r.angleDeg)}`, `  intersection (mid-point of closest approach) ${r.point.map(v => f(v)).join("  ")}`, ""); }
+      const pl = pointsByName(plane.names());
+      if (P && pl.length >= 3) { const fit = planeFit(pl.map(p => p.p)); const r = pointToPlane(P.p, fit.c, fit.n); lines.push(`POINT ${P.name} TO PLANE (${pl.length} pts, flatness RMS ${f(fit.rms)})`, `  offset ${f(r.offset)} ${job.units} (+ on the upper side)`, `  foot ${r.foot.map(v => f(v)).join("  ")}`, ""); }
+      if (lines.length === 2) throw new Error("Pick at least A and B.");
+      const txt = lines.join("\n"); $("pre", res).textContent = txt;
+      const bf = $("#addFoot", act) as HTMLButtonElement, bx = $("#addX", act) as HTMLButtonElement, bc = $("#cp", act) as HTMLButtonElement;
+      bf.disabled = !foot; bx.disabled = !X; bc.disabled = false;
+      bf.onclick = () => { if (!foot || !P) return; upsertPoints(job, [{ name: `${P.name}_FT`, p: foot, source: "fit", code: "FOOT ON LINE" }], "rename"); toast("Foot point added"); refreshStatus(); };
+      bx.onclick = () => { if (!X) return; upsertPoints(job, [{ name: "INT1", p: X, source: "fit", code: "INTERSECTION" }], "rename"); toast("Intersection point added"); refreshStatus(); };
+      bc.onclick = () => navigator.clipboard.writeText(txt).then(() => toast("Copied"));
+    } catch (e: any) { errEl.hidden = false; errEl.textContent = e.message; }
+  };
+};
 
 renderShell(); show("job");

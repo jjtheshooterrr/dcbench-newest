@@ -110,3 +110,66 @@ describe("GeoCOM", () => {
     expect(m.N).toBeCloseTo(600 + 23.456 * Math.sin(88.5 * Math.PI / 180) * Math.cos(45.1234 * Math.PI / 180), 6);
   });
 });
+
+import { sphereFit, cylinderFit } from "../fits";
+import { inverse, pointToLine, pointToPlane, lineLine, angleAt } from "../cogo";
+import { sub, dot, norm } from "../geom";
+
+describe("sphere / cylinder", () => {
+  it("sphere fit recovers centre and radius from a cap of points", () => {
+    const c: Vec3 = [12.5, -3.2, 4.1], r = 0.0725, P: Vec3[] = [];
+    for (let i = 0; i < 12; i++) { const th = 0.3 + 0.1 * i, ph = i * 1.1; P.push([c[0] + r * Math.sin(th) * Math.cos(ph), c[1] + r * Math.sin(th) * Math.sin(ph), c[2] + r * Math.cos(th)]); }
+    const s = sphereFit(P);
+    expect(s.r).toBeCloseTo(r, 9); expect(norm(sub(s.center, c))).toBeLessThan(1e-9); expect(s.rms).toBeLessThan(1e-10);
+    expect(sphereFit(P, r).center[0]).toBeCloseTo(c[0], 8);
+  });
+  it("cylinder fit recovers axis and radius from a 150° arc on a tilted pipe", () => {
+    const o: Vec3 = [3120, 1540, 2015], d = unit([0.97, 0.2, 0.05]), u = unit(cross(d, [0, 0, 1])), v = cross(d, u), r = 0.1095, P: Vec3[] = [];
+    for (let k = 0; k < 5; k++) for (let i = 0; i < 6; i++) { const a = (-75 + i * 30) * Math.PI / 180; P.push(add(add(o, scl(d, k * 0.4)), add(scl(u, r * Math.cos(a)), scl(v, r * Math.sin(a))))); }
+    const c = cylinderFit(P);
+    expect(c.r).toBeCloseTo(r, 7); expect(Math.abs(dot(c.dir, d))).toBeCloseTo(1, 9); expect(c.rms).toBeLessThan(1e-8); expect(c.length).toBeCloseTo(1.6, 6);
+    const w = sub(c.point, o); expect(norm(sub(w, scl(d, dot(w, d))))).toBeLessThan(1e-6); // axis passes through o
+    expect(cylinderFit(P, r).r).toBe(r);
+  });
+  it("vertical pedestal reports tilt", () => {
+    const P: Vec3[] = []; for (let k = 0; k < 3; k++) for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; P.push([10 + 0.5 * Math.cos(a) + 0.002 * k, 20 + 0.5 * Math.sin(a), k]); }
+    const c = cylinderFit(P); expect(c.tiltFromVerticalDeg).toBeCloseTo(Math.atan(0.002) * 180 / Math.PI, 6); expect(c.r).toBeCloseTo(0.5, 6);
+  });
+});
+
+describe("flange two-holing", () => {
+  const mk = (rotDeg: number, nH = 8): Vec3[] => { // flange on a horizontal run along +E: face normal +X, reference = up
+    const P: Vec3[] = []; for (let i = 0; i < nH; i++) { const a = ((i + 0.5) * 360 / nH + rotDeg) * Math.PI / 180; P.push([5, 2 - 0.1016 * Math.sin(a), 1 + 0.1016 * Math.cos(a)]); } return P; };
+  it("is zero for a correctly two-holed flange", () => {
+    const f = flangeFit(mk(0), { nHoles: 8, nominalPCD: 0.2032, axis: "auto" });
+    expect(f.axis).toBe("x"); expect(f.clockReference).toBe("up"); expect(f.twoHoleErrorDeg).toBeCloseTo(0, 8); expect(Math.abs(f.onCentreRotationDeg)).toBeCloseTo(22.5, 8);
+  });
+  it("reports the rotation of a mis-clocked flange", () => {
+    const f = flangeFit(mk(1.25), { nHoles: 8, nominalPCD: 0.2032, axis: "x" });
+    expect(f.twoHoleErrorDeg).toBeCloseTo(1.25, 8); expect(f.twoHoleErrorArc).toBeCloseTo(1.25 * Math.PI / 180 * 0.1016, 9);
+    expect(flangeFit(mk(-3, 4), { nHoles: 4, nominalPCD: 0.2032, axis: "x" }).twoHoleErrorDeg).toBeCloseTo(-3, 8);
+  });
+});
+
+describe("COGO", () => {
+  it("inverse", () => { const r = inverse([0, 0, 0], [3, 4, 12]); expect(r.horiz).toBe(5); expect(r.slope).toBe(13); expect(r.bearingDeg).toBeCloseTo(36.8699, 4); });
+  it("point to line and plane", () => {
+    const r = pointToLine([5, 2, 1], [0, 0, 0], [10, 0, 0]); expect(r.chainage).toBe(5); expect(r.horizOffset).toBeCloseTo(-2, 12); expect(r.dH).toBe(1); expect(r.foot).toEqual([5, 0, 0]);
+    expect(pointToLine([5, -2, 0], [0, 0, 0], [10, 0, 0]).horizOffset).toBeCloseTo(2, 12);
+    expect(pointToPlane([1, 1, 5], [0, 0, 2], [0, 0, 1]).offset).toBe(3);
+  });
+  it("line-line closest approach and angle", () => {
+    const r = lineLine([0, 0, 0], [10, 0, 0], [5, -5, 0.2], [5, 5, 0.2]); expect(r.gap).toBeCloseTo(0.2, 12); expect(r.point).toEqual([5, 0, 0.1]); expect(r.angleDeg).toBeCloseTo(90, 9);
+    expect(() => lineLine([0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0])).toThrow();
+    expect(angleAt([0, 0, 0], [1, 0, 0], [0, 1, 0])).toBeCloseTo(90, 9);
+  });
+});
+
+describe("flange on a horizontal run", () => {
+  it("reports tilt and skew of the face from the design axis", () => {
+    const n = unit([1, Math.tan(0.5 * Math.PI / 180), 0]), up: Vec3 = [0, 0, 1], side = cross(n, up), P: Vec3[] = [];
+    for (let i = 0; i < 8; i++) { const a = (i + 0.5) * Math.PI / 4; P.push(add([5, 2, 1], add(scl(up, 0.1 * Math.cos(a)), scl(side, 0.1 * Math.sin(a))))); }
+    const f = flangeFit(P, { nHoles: 8, nominalPCD: 0.2, axis: "auto" });
+    expect(f.skewDeg).toBeCloseTo(0.5, 8); expect(f.tiltDeg).toBeCloseTo(0, 8); expect(f.normal[0]).toBeGreaterThan(0); expect(f.twoHoleErrorDeg).toBeCloseTo(0, 8);
+  });
+});

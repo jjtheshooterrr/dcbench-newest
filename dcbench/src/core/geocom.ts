@@ -23,7 +23,8 @@ export const RPC = {
   TMC_DoMeasure: 2008, TMC_GetSimpleMea: 2108, TMC_GetCoordinate: 2082, TMC_GetAngle5: 2107,
   TMC_SetOrientation: 2113, TMC_GetAtmCorr: 2029, TMC_SetAtmCorr: 2028,
   BAP_SetMeasPrg: 17019, BAP_GetMeasPrg: 17018, BAP_MeasDistanceAngle: 17017,
-  AUT_MakePositioning: 9037, AUT_Search: 9029, AUT_ChangeFace: 9028,
+  AUT_MakePositioning: 9027, AUT_ChangeFace: 9028, AUT_Search: 9029, AUT_FineAdjust: 9037,
+  TMC_GetPrismCorr: 2023,
   AUS_GetUserAtrState: 18006, AUS_SetUserAtrState: 18005,
   AUS_GetUserLockState: 18008, AUS_SetUserLockState: 18007,
   EDM_Laserpointer: 1004,
@@ -84,6 +85,12 @@ export class GeoComClient {
   async setOrientation(hzDeg: number) { await this.call(RPC.TMC_SetOrientation, [hzDeg * Math.PI / 180]); }
   async setMeasureProgram(prg: number) { await this.call(RPC.BAP_SetMeasPrg, [prg]); }
   async setAtr(on: boolean) { await this.call(RPC.AUS_SetUserAtrState, [on ? 1 : 0]); }
+  /** Prism constant and atmospheric settings exactly as the instrument reports them (read-only, for the job record). */
+  async corrections(): Promise<{ prismConstant: number; wavelength: number; pressure: number; dryTemp: number; wetTemp: number }> {
+    const prism = Number((await this.call(RPC.TMC_GetPrismCorr))[0]);
+    const [wavelength, pressure, dryTemp, wetTemp] = (await this.call(RPC.TMC_GetAtmCorr)).map(Number);
+    return { prismConstant: prism, wavelength, pressure, dryTemp, wetTemp };
+  }
   async laserPointer(on: boolean) { await this.call(RPC.EDM_Laserpointer, [on ? 1 : 0]); }
 
   /** Take a distance+angle measurement; returns Hz/V in degrees, SD in metres, plus reduced coordinates. */
@@ -141,6 +148,8 @@ export class SimulatedInstrument implements Transport {
       case RPC.TMC_SetStation: this.station = { E: p[0], N: p[1], H: p[2], hi: p[3] }; return reply(0);
       case RPC.TMC_GetStation: return reply(0, [this.station.E, this.station.N, this.station.H, this.station.hi]);
       case RPC.TMC_DoMeasure: return reply(0);
+      case RPC.TMC_GetPrismCorr: return reply(0, [0]);
+      case RPC.TMC_GetAtmCorr: return reply(0, [0.658, 1013.25, 12, 12]);
       case RPC.TMC_GetSimpleMea: return reply(0, [this.target.hz * Math.PI / 180, this.target.v * Math.PI / 180, this.target.sd]);
       case RPC.TMC_GetAngle5: return reply(0, [this.target.hz * Math.PI / 180, this.target.v * Math.PI / 180]);
       case RPC.TMC_GetCoordinate: {

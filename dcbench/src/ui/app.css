@@ -67,3 +67,26 @@ canvas{width:100%;height:auto;display:block;border-radius:4px;background:var(--f
 .big{font-family:var(--mono);font-size:22px;font-variant-numeric:tabular-nums}
 .toast{position:fixed;bottom:40px;right:16px;background:var(--fg);color:var(--bg);padding:8px 14px;border-radius:4px;opacity:0;transition:opacity .2s;pointer-events:none}
 .toast.on{opacity:1}
+
+/* layout fixes */
+#app{grid-template-columns:220px minmax(0,1fr)}
+.work{min-width:0}
+.status .spacer{flex:1}
+.menubar .jobname{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:40vw}
+
+/* modal dialogs */
+.modal-bg{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:50}
+.modal{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:18px;width:min(460px,calc(100vw - 32px));box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.modal-msg{white-space:pre-wrap;margin-bottom:12px;user-select:text}
+.modal-field{width:100%;margin-bottom:4px}
+.modal-actions{justify-content:flex-end;margin-top:12px}
+
+/* 3D view */
+canvas.v3d{height:calc(100vh - 230px);min-height:360px;cursor:grab;touch-action:none}
+canvas.v3d:active{cursor:grabbing}
+.viewbar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-bottom:8px}
+.viewbar label{display:flex;align-items:center;gap:6px;color:var(--muted)}
+.viewbar .readout{font-family:var(--mono);font-size:12px;color:var(--muted);margin-left:auto;min-height:1.4em}
+.kv.tight{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 14px}
+.kv.tight label{display:flex;flex-direction:column;gap:3px}
+.kv.tight select{width:100%}

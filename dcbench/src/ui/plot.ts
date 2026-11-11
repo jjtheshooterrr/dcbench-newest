@@ -23,10 +23,11 @@ export function drawPlot(cv: HTMLCanvasElement, p: PlotSpec, hintEl?: HTMLElemen
   const ox = W / 2 - sc * (minx + maxx) / 2, oy = H / 2 + sc * (miny + maxy) / 2;
   const X = (v: number) => ox + v * sc, Y = (v: number) => oy - v * sc;
   ctx.font = "12px " + col("--mono"); ctx.lineWidth = 1;
-  const step = Math.pow(10, Math.floor(Math.log10(span / 4)));
+  const rawStep = span / 7, mag = Math.pow(10, Math.floor(Math.log10(rawStep))), step = ([1, 2, 5, 10].find(k => k * mag >= rawStep) ?? 10) * mag;
+  const gdec = Math.max(0, -Math.floor(Math.log10(step * p.unitFactor) + 1e-9));
   ctx.strokeStyle = col("--line"); ctx.fillStyle = col("--muted");
-  for (let gx = Math.ceil(minx / step) * step; gx <= maxx; gx += step) { ctx.beginPath(); ctx.moveTo(X(gx), 0); ctx.lineTo(X(gx), H); ctx.stroke(); ctx.fillText((gx * p.unitFactor).toFixed(0), X(gx) + 3, H - 6); }
-  for (let gy = Math.ceil(miny / step) * step; gy <= maxy; gy += step) { ctx.beginPath(); ctx.moveTo(0, Y(gy)); ctx.lineTo(W, Y(gy)); ctx.stroke(); ctx.fillText((gy * p.unitFactor).toFixed(0), 4, Y(gy) - 3); }
+  for (let gx = Math.ceil(minx / step) * step; gx <= maxx; gx += step) { ctx.beginPath(); ctx.moveTo(X(gx), 0); ctx.lineTo(X(gx), H); ctx.stroke(); ctx.fillText((gx * p.unitFactor).toFixed(gdec), X(gx) + 3, H - 6); }
+  for (let gy = Math.ceil(miny / step) * step; gy <= maxy; gy += step) { ctx.beginPath(); ctx.moveTo(0, Y(gy)); ctx.lineTo(W, Y(gy)); ctx.stroke(); ctx.fillText((gy * p.unitFactor).toFixed(gdec), 4, Y(gy) - 3); }
   const mags = p.residuals?.map(r => (Array.isArray(r) ? norm(r) : Math.abs(r))) ?? [];
   const exag = mags.length ? Math.max(1, 0.08 * span / Math.max(...mags, 1e-12)) : 1;
   if (p.circle) {
